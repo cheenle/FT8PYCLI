@@ -1,0 +1,27 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python files
+*.py text diff=python
+*.pyw text diff=python
+
+# C source files
+*.c text diff=c
+*.h text diff=c
+
+# Documentation
+*.md text diff=markdown
+*.txt text
+*.rst text
+*.json text
+
+# Binary files
+*.wav binary
+*.pyc binary
+*.so binary
+*.dll binary
+
+# Exclude files from GitHub language statistics
+src/libfano/* linguist-vendored
+src/libldpc/* linguist-vendored
+src/librs/* linguist-vendored 
