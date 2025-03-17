@@ -1,0 +1,1384 @@
+#
+# shared support routines for weak*.py
+#
+
+#
+# read weak.ini
+# e.g. weakcfg.get("wsprmon", "mycall") -> None or "W1XXX"
+#
+
+try:
+  import configparser
+except:
+  from six.moves import configparser
+import threading
+import numpy
+import scipy
+import scipy.signal
+import scipy.fftpack
+import wave
+import time
+import sys
+import os
+import math
+import random
+import types
+#import scikits.samplerate
+from scipy.signal import windows
+try:
+    # 尝试从windows子模块导入
+    from scipy.signal.windows import blackmanharris
+except ImportError:
+    try:
+        # 尝试旧的导入方式
+        from scipy.signal import blackmanharris
+    except ImportError:
+        # 使用自己的实现
+        from blackmanharris import blackmanharris
+
+have_fftw = False
+try:
+  import pyfftw.interfaces.numpy_fft
+  have_fftw = True
+except:
+  pass
+
+def cfg(program, key):
+    cfg = configparser.SafeConfigParser()
+    cfg.read(['weak-local.cfg', 'weak.cfg'])
+
+    if cfg.has_option(program, key):
+        return cfg.get(program, key)
+
+    return None
+
+# make a butterworth IIR bandpass filter
+def butter_bandpass(lowcut, highcut, samplerate, order=5):
+  # http://wiki.scipy.org/Cookbook/ButterworthBandpass
+  nyq = 0.5 * samplerate
+  low = lowcut / nyq
+  high = highcut / nyq
+  b, a = scipy.signal.butter(order, [low, high], btype='bandpass')
+  return b, a
+
+def butter_highpass(cut, samplerate, order=5):
+  nyq = 0.5 * samplerate
+  cut = cut / nyq
+  b, a = scipy.signal.butter(order, cut, btype='highpass')
+  return b, a
+
+def butter_lowpass(cut, samplerate, order=5):
+  nyq = 0.5 * samplerate
+  cut = cut / nyq
+  b, a = scipy.signal.butter(order, cut, btype='lowpass')
+  return b, a
+
+def cheby_lowpass(cut, rate):
+    passhz = cut - 0.0
+    stophz = cut + 50.0
+    b, a = scipy.signal.iirdesign(2.0*passhz/rate,
+                                  2.0*stophz/rate,
+                                  0.5, # ripple_pass
+                                  60.0, # atten_stop
+                                  ftype = "cheby2",
+                                  output="ba")
+    return b, a
+
+def new_cheby_lowpass(passhz, stophz, pass_ripple, stop_atten, rate):
+    b, a = scipy.signal.iirdesign(2.0*passhz/rate,
+                                  2.0*stophz/rate,
+                                  pass_ripple, # ripple_pass
+                                  stop_atten, # atten_stop
+                                  ftype = "cheby1",
+                                  output="ba")
+    return b, a
+
+def old_cheby_highpass(cut, rate):
+    passhz = cut + 0.0
+    stophz = cut - 75.0
+    b, a = scipy.signal.iirdesign(2.0*passhz/rate,
+                                  2.0*stophz/rate,
+                                  0.5, # ripple_pass
+                                  60.0, # atten_stop
+                                  ftype = "cheby1",
+                                  output="ba")
+    return b, a
+
+def cheby_highpass(cut, rate):
+    cut += 25
+    passhz = cut + 25.0
+    stophz = cut - 75.0
+    b, a = scipy.signal.iirdesign(2.0*passhz/rate,
+                                  2.0*stophz/rate,
+                                  0.05, # ripple_pass
+                                  50.0, # atten_stop
+                                  ftype = "cheby2",
+                                  output="ba")
+    return b, a
+
+# passhz - stophz must be pretty big, maybe 100 hz?
+def new_cheby_highpass(stophz, passhz, rate, ripple_pass=0.5, atten_stop=50.0):
+    stophz = max(0.0, stophz)
+    passhz = max(stophz + 1.0, passhz)
+    b, a = scipy.signal.iirdesign(2.0*passhz/rate,
+                                  2.0*stophz/rate,
+                                  ripple_pass,
+                                  atten_stop,
+                                  ftype = "cheby2",
+                                  output="ba")
+    return b, a
+
+# FIR bandpass filter
+# http://stackoverflow.com/questions/16301569/bandpass-filter-in-python
+def bandpass_firwin(ntaps, lowcut, highcut, fs, window='hamming'):
+    nyq = 0.5 * fs
+    taps = scipy.signal.firwin(ntaps, [lowcut, highcut], nyq=nyq, pass_zero=False,
+                               window=window, scale=False)
+    return taps
+
+#
+# frequency shift via hilbert transform (like SSB).
+# Lev Givon, https://gist.github.com/lebedov/4428122
+#
+def nextpow2(x):
+    """Return the first integer N such that 2**N >= abs(x)"""
+    return int(numpy.ceil(numpy.log2(numpy.abs(x))))
+
+def pre_freq_shift(x):
+    N_orig = len(x)
+    N_padded = 2**nextpow2(N_orig)
+    x0 = numpy.append(x, numpy.zeros(N_padded-N_orig, x.dtype))
+    hilb = scipy.signal.hilbert(x0)
+    return hilb
+
+# f_shift in Hz.
+# dt is 1 / sample rate (e.g. 1.0/11025).
+# frequencies near the low and high ends of the spectrum are
+# reflected, so large shifts will be a problem.
+# if pre_hilbert!=None, it should be the result of pre_freq_shift(x).
+def freq_shift(x, f_shift, dt, pre_hilbert=None):
+    """Shift the specified signal by the specified frequency."""
+
+    # Pad the signal with zeros to prevent the FFT invoked by the transform from
+    # slowing down the computation:
+    N_orig = len(x)
+    N_padded = 2**nextpow2(N_orig)
+    t = numpy.arange(0, N_padded)
+    lo = numpy.exp(2j*numpy.pi*f_shift*dt*t)
+
+    if isinstance(pre_hilbert, type(None)) == False:
+        hilb = pre_hilbert
+        assert len(hilb) == len(x) + N_padded - N_orig
+    else:
+        hilb = pre_freq_shift(x)
+
+    h = hilb*lo
+    ret = h[:N_orig].real
+    return ret
+
+def one_test_freq_shift(rate, hz, n, f_shift):
+    t1 = costone(rate, hz, n)
+
+    t2 = freq_shift(t1, f_shift, 1.0 / rate)
+
+    expected = costone(rate, hz + f_shift, n)
+
+    if False:
+        import matplotlib.pyplot as plt
+        i = 1000
+        j = i + 1000
+        plt.plot(t1[i:j])
+        plt.plot(t2[i:j])
+        plt.plot(expected[i:j])
+        plt.show()
+
+    diff = t2 - expected
+    x = math.sqrt(numpy.mean(diff * diff))
+    return x
+
+def test_freq_shift():
+    x = one_test_freq_shift(12000, 511, 12000*13, 6.25 / 4)
+    print(x)
+
+    t1 = numpy.random.rand(12000 * 13)
+    t1 += costone(12000, 5970, 12000 * 13)
+    t1 += costone(12000, 511, 12000 * 13)
+    #t1 += costone(12000, 10, 12000 * 13)
+
+    t2 = freq_shift(t1, 60, 1.0 / 12000)
+
+    t3 = freq_shift(t2, -60, 1.0 / 12000)
+
+    diff = t3 - t1
+    x = math.sqrt(numpy.mean(diff * diff))
+    print(x)
+
+    writewav(t1, "t1.wav", 12000)
+    writewav(t2, "t2.wav", 12000)
+    writewav(t3, "t3.wav", 12000)
+
+# caller supplies two shifts, in hza[0] and hza[1].
+# shift x[0] by hza[0], ..., x[-1] by hza[1]
+# corrects for phase change:
+# http://stackoverflow.com/questions/3089832/sine-wave-glissando-from-one-pitch-to-another-in-numpy
+# sadly, more expensive than piece-wise freq_shift() because
+# the ramp part does noticeable work.
+def freq_shift_ramp(x, hza, dt):
+    N_orig = len(x)
+    N_padded = 2**nextpow2(N_orig)
+    t = numpy.arange(0, N_padded)
+    f_shift = numpy.linspace(hza[0], hza[1], len(x))
+    f_shift = numpy.append(f_shift, hza[1]*numpy.ones(N_padded-len(x)))
+
+    pc1 = f_shift[:-1] - f_shift[1:]
+    phase_correction = numpy.add.accumulate(
+      t * dt * numpy.append(numpy.zeros(1), 2*numpy.pi*pc1))
+
+    lo = numpy.exp(1j*(2*numpy.pi*dt*f_shift*t + phase_correction))
+    x0 = numpy.append(x, numpy.zeros(N_padded-N_orig, x.dtype))
+    h = scipy.signal.hilbert(x0)*lo
+    ret = h[:N_orig].real
+    return ret
+
+# avoid most of the round-up-to-power-of-two penalty by
+# doing log-n shifts. discontinuity at boundaries,
+# but that's OK for JT65 2048-sample symbols.
+def freq_shift_hack(x, hza, dt):
+    a = freq_shift_hack_iter(x, hza, dt)
+    return numpy.concatenate(a)
+
+def freq_shift_hack_iter(x, hza, dt):
+    if len(x) <= 4096:
+        return [ freq_shift(x, (hza[0] + hza[1]) / 2.0, dt) ]
+    lg = nextpow2(len(x))
+    if len(x) == 2**lg:
+        return [ freq_shift_ramp(x, hza, dt) ]
+    
+    i1 = 2**(lg-1)
+    hz_i1 = hza[0] + (i1 / float(len(x)))*(hza[1] - hza[0])
+    ret = [ freq_shift_ramp(x[0:i1], [ hza[0], hz_i1 ], dt) ]
+    ret +=  freq_shift_hack_iter(x[i1:], [ hz_i1, hza[1] ], dt) 
+    return ret
+
+# pure sin tone, n samples long.
+def sintone(rate, hz, n):
+    x = numpy.linspace(0, 2 * hz * (n / float(rate)) * numpy.pi, n,
+                       endpoint=False)
+    tone = numpy.sin(x)
+    return tone
+
+# pure cos tone, n samples long.
+def costone(rate, hz, n, phase0=0.0):
+    x = numpy.linspace(phase0, phase0 + 2 * hz * (n / float(rate)) * numpy.pi, n,
+                       endpoint=False)
+    tone = numpy.cos(x)
+    return tone
+
+# parameter
+fos_threshold = 0.5
+
+# cache
+fos_mu = threading.Lock()
+fos_hz = None
+fos_fft = None
+fos_n = None
+
+# shift signal a up by hz, returning
+# the rfft of the resulting signal.
+# do it by convolving ffts.
+# use numpy.fft.irfft(ret, len(a)) to get the signal.
+# intended for single power-of-two-length JT65 symbols.
+# faster than freq_shift() if you need the fft (not the
+# actual resulting signal).
+def fft_of_shift(a, hz, rate):
+    global fos_hz, fos_n, fos_fft
+
+    afft = rfft(a)
+
+    bin_hz = rate / float(len(a))
+
+    # we want this many fft bins on either side of the tone.
+    pad_bins = 10
+
+    # shift the tone up by integral bins until it is
+    # enough above zero that we get fft bins on either side.
+    # XXX if hz is more than 10 bins above zero, negative shift.
+    if hz >= 0:
+        shift_bins = max(0, pad_bins - int(hz / bin_hz))
+    else:
+        shift_bins = int((-hz) / bin_hz) + pad_bins
+    hz += shift_bins * bin_hz
+
+    # fos_mu.acquire()
+    if fos_n == len(a) and abs(fos_hz - hz) < fos_threshold:
+        lofft = fos_fft
+    else:
+        lo = sintone(rate, hz, len(a))
+        lofft = rfft(lo)
+        fos_hz = hz
+        fos_fft = lofft
+        fos_n = len(a)
+    # fos_mu.release()
+
+    lo_bin = int(hz / bin_hz)
+    lofft = lofft[0:lo_bin+pad_bins]
+
+    outfft = numpy.convolve(lofft, afft, 'full')
+    outfft = outfft[shift_bins:]
+
+    outfft = outfft[0:len(afft)]
+    return outfft
+
+# https://gist.github.com/endolith/255291
+# thank you, endolith.
+def parabolic(f, x):
+    """Quadratic interpolation for estimating the true position of an
+    inter-sample maximum when nearby samples are known.
+   
+    f is a vector and x is an index for that vector.
+   
+    Returns (vx, vy), the coordinates of the vertex of a parabola that goes
+    through point x and its two neighbors.
+   
+    Example:
+    Defining a vector f with a local maximum at index 3 (= 6), find local
+    maximum if points 2, 3, and 4 actually defined a parabola.
+   
+    In [3]: f = [2, 3, 1, 6, 4, 2, 3, 1]
+   
+    In [4]: parabolic(f, argmax(f))
+    Out[4]: (3.2142857142857144, 6.1607142857142856)
+   
+    """
+    if x < 1 or x+1 >= len(f):
+        return None
+    denom = (f[x-1] - 2 * f[x] + f[x+1])
+    if denom == 0.0:
+        return None
+    xv = 1/2. * (f[x-1] - f[x+1]) / denom + x
+    yv = f[x] - 1/4. * (f[x-1] - f[x+1]) * (xv - x)
+    return (xv, yv)
+
+# indexed by window length
+fff_cached_windows = { }
+
+def init_freq_from_fft(n):
+    n = int(n)
+    if not n in fff_cached_windows:
+        fff_cached_windows[n] = blackmanharris(n)
+
+# https://gist.github.com/endolith/255291
+def freq_from_fft(sig, rate, minf, maxf):
+    global fff_cached_windows
+
+    n = len(sig)
+    
+    assert n in fff_cached_windows
+
+    fa = sig
+    fa = fa * fff_cached_windows[n]
+
+    #fa = abs(numpy.fft.rfft(fa))
+    fa = arfft(fa)
+
+    # find max between minf and maxf
+    mini = int(minf * n / rate)
+    maxi = int(maxf * n / rate)
+
+    i = numpy.argmax(fa[mini:maxi]) + mini # peak bin
+
+    if i < 1 or i+1 >= len(fa) or fa[i] <= 0.0:
+        return None
+
+    if fa[i-1] == 0.0 or fa[i] == 0.0 or fa[i+1] == 0.0:
+        return None
+
+    xp = parabolic(numpy.log(fa[i-1:i+2]), 1) # interpolate
+    if xp == None:
+        return None
+    true_i = xp[0] + i - 1
+
+    return rate * true_i / float(n) # convert to frequency
+
+# like freq_from_fft, but in units of FFT bins.
+def bin_from_fft(sig, rate, bin):
+    global fff_cached_windows
+    n = len(sig)
+    assert n in fff_cached_windows
+
+    sig = sig * fff_cached_windows[n]
+    fa = arfft(sig)
+
+    xp = parabolic(numpy.log(fa[bin-1:bin+2]), 1) # interpolate
+    if xp == None:
+        return None
+    true_bin = xp[0] + bin - 1
+    return true_bin
+
+def moving_average(a, n):
+    ret = numpy.cumsum(a, dtype=float)
+    ret[n:] = ret[n:] - ret[:-n]
+    ret = ret[n - 1:] / n
+
+    if (n % 2) == 1:
+        slop = n // 2 # ret is short on either end by this
+        assert len(ret) == len(a) - 2*slop
+        ret = numpy.concatenate(( ret[0:slop], ret, ret[-slop:] ))
+    else:
+        slop = n // 2 # ret is short on either end by this
+        assert len(ret) == len(a) - 2*slop + 1
+        ret = numpy.append(ret[0:slop], ret)
+        if slop > 1:
+            ret = numpy.append(ret, ret[-(slop-1):])
+
+    return ret
+
+# IQ -> USB
+# the result is bad at the start and end,
+# so not ideal for processing a sequence of
+# sample blocks.
+def iq2usb_internal(iq):
+    ii = iq.real
+    qq = iq.imag
+    nn = len(iq)
+    ii = numpy.real(scipy.signal.hilbert(ii, nn)) # delay to match hilbert(Q)
+    qq = numpy.imag(scipy.signal.hilbert(qq, nn))
+    ssb = numpy.subtract(ii, qq) # usb from phasing method
+    #ssb = numpy.add(ii, qq) # lsb from phasing method
+    assert len(iq) == len(ssb)
+    return ssb
+
+# do it in overlapping smallish chunks, so the FFTs are smaller
+# and faster.
+# always returns the same number of samples as you give it.
+def iq2usb(iq):
+    guard = 256 # overlap between successive chunks
+    chunksize = 8192 - 2*guard
+
+    bufbuf = [ ]
+    oi = 0 # output index, == sum of bufbuf[] lengths
+    while oi < len(iq):
+        sz = min(chunksize, len(iq) - oi)
+        buf = iq[oi:oi+sz]
+
+        # pad so always chunksize
+        if len(buf) < chunksize:
+            buf = numpy.append(buf, numpy.zeros(chunksize - len(buf)))
+        
+        # prepend the guard
+        if oi >= guard:
+            buf = numpy.append(iq[oi-guard:oi], buf)
+        else:
+            buf = numpy.append(numpy.zeros(guard), buf)
+
+        # append the guard
+        n1 = min(guard, len(iq) - (oi + chunksize))
+        n1 = max(n1, 0)
+        if n1 > 0:
+            buf = numpy.append(buf, iq[oi+chunksize:oi+chunksize+n1])
+        if n1 < guard:
+            buf = numpy.append(buf, numpy.zeros(guard - n1))
+
+        assert len(buf) == chunksize + 2*guard
+
+        z = iq2usb_internal(buf)
+
+        assert len(z) == chunksize + 2*guard
+
+        bufbuf.append(z[guard:-guard])
+        oi += len(bufbuf[-1])
+
+    buf = numpy.concatenate(bufbuf)
+    assert len(buf) >= len(iq)
+    buf = buf[0:len(iq)]
+    return buf
+
+# simple measure of distortion introduced by iq2usb.
+def one_test_iq2usb(rate, hz, n):
+    ii = costone(rate, hz, n)
+    qq = sintone(rate, hz, n)
+    iq = ii + 1j*qq
+    usb = iq2usb(iq)
+
+    # usb ought to be 2*ii
+    
+    if False:
+        import matplotlib.pyplot as plt
+        plt.plot(ii[0:100])
+        plt.plot(qq[0:100])
+        plt.plot(usb[0:100])
+        plt.show()
+
+    diff = (usb / 2.0) - ii
+    x = math.sqrt(numpy.mean(diff * diff))
+    return x
+
+# original (no chunking):
+#   32000 511 1333: 0.038 0.001
+#   32000 511 27777: 0.010 0.016
+#   32000 511 320001: 0.000 6.345
+# chunksize 8192, guard 128
+#   32000 511 1333: 0.023 0.002
+#   32000 511 27777: 0.006 0.006
+#   32000 511 320001: 0.002 0.041
+def test_iq2usb():
+    for [ rate, hz, n ] in [
+            [ 32000, 511, 1333 ],
+            [ 32000, 511, 27777 ],
+            [ 32000, 511, 320001 ]
+            ]:
+        t0 = time.time()
+        x = one_test_iq2usb(rate, hz, n)
+        t1 = time.time()
+        print("%d %d %d: %.3f %.3f" % (rate, hz, n, x, t1 - t0))
+
+# "scipy" -- scipy.signal.resample(), the default
+# "interp" -- numpy.interp()
+# "rabbit" -- Secret Rabbit Code
+which_resampler = "scipy"
+
+# change sampling rate from from_rate to to_rate.
+# buf must already be low-pass filtered if to_rate < from_rate.
+# note that result probably has slightly different
+# length in seconds, so caller may want to adjust.
+def resample(buf, from_rate, to_rate):
+    # how many samples do we want?
+    target = int(round((len(buf) / float(from_rate)) * to_rate))
+
+    if which_resampler == "rabbit":
+        ratio = to_rate / float(from_rate)
+        buf1 = scikits.samplerate.resample(buf, ratio, 'sinc_best')
+        return buf1
+
+    if from_rate == to_rate:
+        return buf
+
+    if from_rate == to_rate * 2:
+        buf = buf[0::2]
+        return buf
+
+    if from_rate == to_rate * 4:
+        buf = buf[0::4]
+        return buf
+
+    if False:
+        if from_rate == to_rate * 10:
+            print("resample/10", from_rate, to_rate)
+            buf = buf[0::10]
+            return buf
+
+        if from_rate == to_rate * 20:
+            print("resample/20", from_rate, to_rate)
+            buf = buf[0::20]
+            return buf
+
+        if from_rate == to_rate * 30:
+            print("resample/30", from_rate, to_rate)
+            buf = buf[0::30]
+            return buf
+
+        if from_rate == to_rate * 40:
+            print("resample/40", from_rate, to_rate)
+            buf = buf[0::40]
+            return buf
+
+    # 11025 -> 441, for wwvmon.py.
+    if from_rate == to_rate * 25:
+        buf = buf[0::25]
+        return buf
+
+    # 11025 -> 315, for wwvmon.py.
+    if from_rate == to_rate * 35:
+        buf = buf[0::35]
+        return buf
+
+    if from_rate == to_rate * 64:
+        buf = buf[0::64]
+        return buf
+
+    if which_resampler == "scipy":
+        # seems to produce better results than numpy.interp() but
+        # is slower, sometimes much slower.
+        # pad to power of two length
+        nn = 2**nextpow2(len(buf))
+        buf = numpy.append(buf, numpy.zeros(nn - len(buf)))
+        want = (len(buf) / float(from_rate)) * to_rate
+        want = int(round(want))
+        buf = scipy.signal.resample(buf, want)
+    elif which_resampler == "interp":
+        secs =  len(buf)*(1.0/from_rate)
+        ox = numpy.arange(0, secs, 1.0 / from_rate)
+        ox = ox[0:len(buf)]
+        nx = numpy.arange(0, secs, 1.0 / to_rate)
+        buf = numpy.interp(nx, ox, buf)
+    else:
+        assert False
+
+    if len(buf) > target:
+        buf = buf[0:target]
+
+    return buf
+
+# gadget to low-pass-filter and re-sample a multi-block
+# stream without losing fractional samples at block
+# boundaries, which would hurt phase-shift demodulators
+# like WWVB.
+class Resampler:
+    def __init__(self, from_rate, to_rate, order=7):
+        self.from_rate = from_rate
+        self.to_rate = to_rate
+
+        if self.from_rate > self.to_rate:
+            # prepare a filter to precede resampling.
+            self.filter = butter_lowpass(0.45 * self.to_rate,
+                                         from_rate,
+                                         order)
+            self.zi = scipy.signal.lfiltic(self.filter[0],
+                                           self.filter[1],
+                                           [0])
+
+        # total number of input and output samples,
+        # so we can insert/delete to keep long-term
+        # rates correct.
+        self.nin = 0
+        self.nout = 0
+
+        if which_resampler == "rabbit":
+            self.rabbit = scikits.samplerate.Resampler('sinc_best', channels=1)
+
+    # how much will output be delayed?
+    # in units of output samples.
+    def delay(self, hz):
+        if self.from_rate > self.to_rate:
+            # convert hz to radians per sample,
+            # at input sample rate.
+            rps = (1.0 / hz) * (2 * math.pi) / self.from_rate
+            gd = scipy.signal.group_delay(self.filter, w=[rps])
+            n = (gd[1][0] / self.from_rate) * self.to_rate
+            return n
+        else:
+            return 0
+
+    def resample(self, buf):
+        # if resample() uses FFT, then handing it huge chunks is
+        # slow. so cut big buffers into one-second chunks.
+        a = [ ]
+        i = 0
+        if self.from_rate > 20000:
+            big = self.from_rate // 2
+        else:
+            big = self.from_rate
+        while i < len(buf):
+            left = len(buf) - i
+            chunk = None
+            if left > 1.5*big:
+                chunk = big
+            else:
+                chunk = left
+            a.append(self.resample1(buf[i:i+chunk]))
+            i += chunk
+        b = numpy.concatenate(a)
+        return b
+
+    def resample1(self, buf):
+        inlen = len(buf)
+        savelast = buf[-20:]
+
+        insec = self.nin / float(self.from_rate)
+        outsec = self.nout / float(self.to_rate)
+        if insec - outsec > 0.5 / self.from_rate:
+            ns = (insec - outsec) / (1.0 / self.from_rate)
+            ns = int(round(ns))
+            if ns < 1:
+                ns = 1
+            assert len(self.last) >= ns
+            buf = numpy.append(self.last[-ns:], buf)
+        if outsec - insec > 0.5 / self.from_rate:
+            ns = (outsec - insec) / (1.0 / self.from_rate)
+            ns = int(round(ns))
+            if ns < 1:
+                ns = 1
+            buf = buf[ns:]
+        
+        self.last = savelast
+
+        if self.from_rate > self.to_rate:
+            # low-pass filter.
+            zi = scipy.signal.lfilter(self.filter[0],
+                                      self.filter[1],
+                                      buf,
+                                      zi=self.zi)
+            buf = zi[0]
+            self.zi = zi[1]
+
+        if which_resampler == "rabbit":
+            ratio = self.to_rate / float(self.from_rate)
+            buf = self.rabbit.process(buf, ratio, end_of_input=False)
+        else:
+            buf = resample(buf, self.from_rate, self.to_rate)
+            
+        self.nin += inlen
+        self.nout += len(buf)
+
+        return buf
+
+def one_test_resampler(from_rate, to_rate):
+    hz = 100
+    t1 = costone(from_rate, hz, from_rate*10)
+
+    r = Resampler(from_rate, to_rate)
+
+    i = 0
+    bufbuf = [ ]
+    while i < len(t1):
+        n = random.randint(1, from_rate)
+        buf = r.resample(t1[i:i+n])
+        bufbuf.append(buf)
+        i += n
+    t2 = numpy.concatenate(bufbuf)
+
+    expecting = costone(to_rate, hz, to_rate*10)
+    delay = r.delay(hz)
+    delay = int(round(delay))
+    expecting = numpy.append(numpy.zeros(delay), expecting)
+    expecting = expecting[0:to_rate*10]
+
+    diff = t2 - expecting
+    x = math.sqrt(numpy.mean(diff * diff))
+
+    if False:
+        import matplotlib.pyplot as plt
+        i0 = len(diff) - 200
+        i1 = i0 + 200
+        plt.plot(expecting[i0:i1])
+        plt.plot(t2[i0:i1])
+        plt.plot(diff[i0:i1])
+        plt.show()
+
+    return x
+
+# measure Resampler distortion.
+# not very revealing since the filter delay
+# prevents easy comparison.
+def test_resampler():
+    global resample_interp
+    ori = resample_interp
+
+    for [ r1, r2 ] in [
+            [ 32000, 12000 ],
+            [ 3000, 400 ],
+            [ 3000, 300 ],
+            [ 8000, 400 ],
+            [ 8000, 300 ],
+            ]:
+
+        resample_interp = False
+        x = one_test_resampler(r1, r2)
+        print("%d %d False: %.3f" % (r1, r2, x))
+
+        #resample_interp = True
+        #x = one_test_resampler(r1, r2)
+        #print("%d %d True: %.3f" % (r1, r2, x))
+
+    resample_interp = ori
+
+which_fft = "scipy" # numpy, scipy, fftw
+if have_fftw == False and which_fft == "fftw":
+    which_fft = "scipy"
+fftw_info = { }
+fftw_n_info_79 = { }
+fftw_n_info_103 = { }
+fftw_i_info = { }
+fft_inited = False
+fftw_inited = False
+fft_size_list = [ ]
+
+# specify sizes which fftw should optimize for
+def fft_sizes(sizes):
+    global fft_size_list
+    for sz in sizes:
+        if not (sz in fft_size_list):
+            assert fft_inited == False and fftw_inited == False
+            fft_size_list += [ sz ]
+
+def init_fft():
+    global fft_inited, fftw_inited
+
+    ##if pyfftw.interfaces.cache.is_enabled() == False:
+    ##    pyfftw.interfaces.cache.enable()
+    ##    pyfftw.interfaces.cache.set_keepalive_time(30.0)
+    if have_fftw and which_fft == "fftw" and fftw_inited == False:
+        fftw_inited = True
+        print("starting fftw init ", fft_size_list)
+        sys.stdout.flush()
+        for size in fft_size_list:
+            if not (size in fftw_info):
+                a = pyfftw.empty_aligned(size, dtype='float64')
+                fft = pyfftw.builders.rfft(a, planner_effort='FFTW_PATIENT')
+                fftw_info[size] = fft
+
+                # for FT8's 79 symbols
+                a = pyfftw.empty_aligned((79,size), dtype='float64')
+                fft = pyfftw.builders.rfftn(a, axes=[1],
+                                            planner_effort='FFTW_PATIENT')
+                fftw_n_info_79[size] = fft
+
+                # for FT4's 103 symbols
+                a = pyfftw.empty_aligned((103,size), dtype='float64')
+                fft = pyfftw.builders.rfftn(a, axes=[1],
+                                            planner_effort='FFTW_PATIENT')
+                fftw_n_info_103[size] = fft
+
+                a = pyfftw.empty_aligned((size//2)+1, dtype='complex128')
+                fft = pyfftw.builders.irfft(a, planner_effort='FFTW_PATIENT')
+                fftw_i_info[(size//2)+1] = fft
+        print("done with fftw init")
+        sys.stdout.flush()
+
+    if fft_inited == False:
+        fft_inited = True
+        for size in fft_size_list:
+            # warm up twiddle cache
+            a = numpy.random.random(size)
+            rfft(a)
+
+# wrapper for either numpy or scipy rfft(),
+# followed by abs().
+# scipy rfft() is nice b/c it supports float32.
+# but not faster for 2048-point FFTs.
+def arfft(x):
+    init_fft()
+
+    if which_fft == "numpy" or which_fft == "fftw":
+        y = rfft(x)
+        y = abs(y)
+        return y
+
+    if which_fft == "scipy":
+        assert (len(x) % 2) == 0
+
+        y = scipy.fftpack.rfft(x)
+
+        if type(y[0]) == numpy.float32:
+            cty = numpy.complex64
+        elif type(y[0]) == numpy.float64:
+            cty = numpy.complex128
+        else:
+            assert False
+
+        # y = [ Re0, Re1, Im1, Re2, Im2, ..., ReN ]
+        #y1 = numpy.sqrt(numpy.add(numpy.square(y[1:-1:2]),
+        #                          numpy.square(y[2:-1:2])))
+        y0 = abs(y[0])
+        yn = abs(y[-1])
+        y = abs(y[1:-1].view(cty))
+        y = numpy.concatenate(([y0], y, [yn]))
+        return y
+
+    assert False
+
+# wrapper for either numpy or scipy rfft().
+# scipy rfft() is nice b/c it supports float32.
+# but not faster for 2048-point FFTs.
+def rfft(x):
+    global fftw_info
+
+    init_fft()
+
+    if which_fft == "numpy":
+        y = numpy.fft.rfft(x)
+        return y
+
+    if which_fft == "fftw":
+        y = fftw_info[len(x)](x)
+        y = numpy.copy(y)
+        return y
+
+    if which_fft == "scipy":
+        assert (len(x) % 2) == 0
+
+        y = scipy.fftpack.rfft(x)
+
+        if type(y[0]) == numpy.float32:
+            cty = numpy.complex64
+        elif type(y[0]) == numpy.float64:
+            cty = numpy.complex128
+        else:
+            assert False
+
+        # y = [ Re0, Re1, Im1, Re2, Im2, ..., ReN ]
+        y1 = y[1:-1].view(cty)
+        y = numpy.concatenate((y[0:1], y1, y[-1:]))
+        return y
+
+    assert False
+
+# x should be a numpy array of complex numbers,
+# as generated by rfft().
+def irfft(x):
+    global fftw_info
+
+    init_fft()
+
+    if which_fft == "numpy":
+        y = numpy.fft.irfft(x)
+        return y
+
+    if which_fft == "fftw":
+        y = fftw_i_info[len(x)](x)
+        y = numpy.copy(y)
+        return y
+
+    if which_fft == "scipy":
+        if type(x[0]) == numpy.complex64:
+            ty = numpy.float32
+        else:
+            ty = numpy.float64
+        # xx wants to be [ Re0, Re1, Im1, Re2, Im2, ..., ReN ]
+        xx = numpy.zeros(2 * len(x) - 2, dtype=ty)
+        xx[1::2] = numpy.real(x[1:])
+        xx[2::2] = numpy.imag(x[1:-1])
+        xx[0] = numpy.real(x[0])
+
+        y = scipy.fftpack.irfft(xx)
+
+        return y
+
+    assert False
+
+def time_irfft():
+    # laptop. similar on Linux and FreeBSD, though numpy is only 2x slower than scipy.
+    #   numpy 0.029132
+    #   scipy 0.009165
+    #   fftw  0.003470
+
+    n = 480
+    fft_sizes([n])
+
+    global which_fft
+
+    v1 = numpy.random.random(n)
+    v2 = rfft(v1)
+
+    which_fft = "numpy"
+    init_fft()
+    t0 = time.time()
+    for i in range(0, 1000):
+        v3 = irfft(v2)
+    t1 = time.time()
+    assert len(v3) == n
+    print("%s %.6f" % (which_fft, t1 - t0))
+
+    which_fft = "scipy"
+    init_fft()
+    t0 = time.time()
+    for i in range(0, 1000):
+        v3 = irfft(v2)
+    t1 = time.time()
+    assert len(v3) == n
+    print("%s %.6f" % (which_fft, t1 - t0))
+
+    which_fft = "fftw"
+    init_fft()
+    t0 = time.time()
+    for i in range(0, 1000):
+        v3 = irfft(v2)
+    t1 = time.time()
+    assert len(v3) == n
+    print("%s %.6f" % (which_fft, t1 - t0))
+
+# you may need to numpy.copy() the input array.
+def rfftn(x, axes=None):
+    global fftw_n_info_79, fftw_n_info_103
+
+    init_fft()
+
+    if which_fft == "numpy" or which_fft == "scipy":
+        y = numpy.fft.rfftn(x, axes=axes)
+        return y
+
+    if which_fft == "fftw":
+        assert axes == [ 1 ]
+        if x.shape[0] == 79:
+          y = fftw_n_info_79[x.shape[1]](x)
+        elif x.shape[0] == 103:
+          y = fftw_n_info_103[x.shape[1]](x)
+        else:
+          assert False
+        return y
+
+    assert False
+
+# apply automatic gain control.
+# causes each winlen window of samples
+# to have average absolute value of 1.0.
+# winlen is in units of samples.
+def agc(samples, winlen):
+    assert winlen >= 3 # tukey only works if winlen > 2
+    agcwin = scipy.signal.tukey(winlen)
+    agcwin = agcwin / numpy.sum(agcwin)
+    mavg = numpy.convolve(abs(samples), agcwin)[winlen/2:]
+    mavg = mavg[0:len(samples)]
+    samples = numpy.divide(samples, mavg)
+    samples = numpy.nan_to_num(samples)
+    return samples
+
+def refagc(samples, refsamples, winlen):
+    assert winlen >= 3 # tukey only works if winlen > 2
+    agcwin = scipy.signal.tukey(winlen)
+    agcwin = agcwin / numpy.sum(agcwin)
+    mavg = numpy.convolve(abs(refsamples), agcwin)[winlen/2:]
+    mavg = mavg[0:len(refsamples)]
+    samples = numpy.divide(samples, mavg)
+    samples = numpy.nan_to_num(samples)
+    return samples
+
+# write a mono file
+def writewav(left, filename, rate):
+  ww = wave.open(filename, 'wb')
+  ww.setnchannels(1)
+  ww.setsampwidth(2)
+  ww.setframerate(rate)
+
+  # ensure signal levels are OK.
+  mx = numpy.max(abs(left))
+  left = (2000.0 * left) / mx
+
+  # convert to 16-bit ints
+  a = numpy.array(left, dtype=numpy.int16)
+
+  # convert to python raw byte string
+  a = a.tostring()
+
+  ww.writeframes(a)
+
+  ww.close()
+
+# write a stereo file
+def writewav2(left, right, filename, rate):
+  ww = wave.open(filename, 'wb')
+  ww.setnchannels(2)
+  ww.setsampwidth(2)
+  ww.setframerate(rate)
+
+  # ensure signal levels are OK.
+  mx = numpy.max(left)
+  left = (10000.0 * left) / mx
+  mx = numpy.max(right)
+  right = (10000.0 * right) / mx
+
+  # interleave.
+  a = numpy.zeros(len(left) + len(right))
+  a[0::2] = left
+  a[1::2] = right
+
+  # convert to 16-bit ints
+  a = numpy.array(a, dtype=numpy.int16)
+
+  # convert to python raw byte string
+  a = a.tostring()
+
+  ww.writeframes(a)
+
+  ww.close()
+
+# read a whole mono wav file.
+# return None or [ rate, samples ].
+def readwav(filename):
+    w = wave.open(filename)
+    channels = w.getnchannels()
+    width = w.getsampwidth()
+    rate = w.getframerate()
+
+    if width != 1 and width != 2:
+        sys.stderr.write("oops width %d in %s" % (width, filename))
+        w.close()
+        return None
+    if channels != 1 and channels != 2:
+        sys.stderr.write("oops channels %d in %s" % (channels, filename))
+        w.close()
+        return None
+
+    bufbuf = [ ]
+    while True:
+        z = w.readframes(8192)
+        if len(z) < 1:
+            break
+        if width == 1:
+            zz = numpy.frombuffer(z, numpy.int8)
+        else:
+            assert (len(z) % 2) == 0
+            zz = numpy.frombuffer(z, numpy.int16)
+        if channels == 2:
+            zz = zz[0::2] # left channel
+        bufbuf.append(zz)
+
+    samples = numpy.concatenate(bufbuf)
+
+    w.close()
+    return [ rate, samples ]
+
+#
+# gray code
+# https://rosettacode.org/wiki/Gray_code
+#
+
+def int2bin(n, nb):
+  'From positive integer to list of binary bits, msb at index 0'
+  if n:
+    bits = []
+    while n:
+      n,remainder = divmod(n, 2)
+      bits.insert(0, remainder)
+    out = bits
+  else:
+    out = [0]
+  while len(out) < nb:
+    out = [0] + out
+  return out
+ 
+ 
+def bin2int(bits):
+  'From binary bits, msb at index 0 to integer'
+  i = 0
+  for bit in bits:
+    i = i * 2 + bit
+  return i
+
+def bin2gray(x, nb):
+  bits = int2bin(x, nb)
+  gbits = bits[:1] + [i ^ ishift for i, ishift in zip(bits[:-1], bits[1:])]
+  return bin2int(gbits)
+ 
+def gray2bin(x, nb):
+  bits = int2bin(x, nb)
+  b = [bits[0]]
+  for nextb in bits[1:]: b.append(b[-1] ^ nextb)
+  return bin2int(b)
+
+# generate coherent FSK.
+# symbols[] are the symbols to encode.
+# hza[0] is start hz of base tone, hza[1] is end hz,
+#   can be different if drift.
+# spacing is the space in hz between FSK tones.
+# rate is samples per second.
+# symsamples is samples per symbol.
+def fsk(symbols, hza, spacing, rate, symsamples, phase0=0.0):
+    # compute frequency for each symbol, in hz[0]..hz[1].
+    symhz = numpy.zeros(len(symbols))
+    for bi in range(0, len(symbols)):
+        base_hz = hza[0] + (hza[1] - hza[0]) * (bi / float(len(symbols)))
+        fr = base_hz + (symbols[bi] * spacing)
+        symhz[bi] = fr
+
+    # frequency for each sample.
+    hzv = numpy.repeat(symhz, symsamples)
+
+    # advance angle for each sample
+    dtheta = (hzv * 2.0 * numpy.pi) / float(rate)
+
+    # start at pi/2 (so it's a cosine wave),
+    # and so that (for FT8 &c) FFT phases are zero for
+    # all symbols when hz is centered on a bin and
+    # the FFTs start exactly at the start of the signal.
+    dtheta = numpy.append([math.pi/2], dtheta[0:-1])
+
+    # cumulative angle.
+    angles = numpy.cumsum(dtheta)
+
+    # start at indicated phase.
+    angles = angles + phase0
+
+    a = numpy.sin(angles)
+
+    return a
+
+# copied from wsjt-x ft2/gfsk_pulse.f90.
+def gfsk_point(b, t):
+    c = numpy.pi * math.sqrt(2.0 / math.log(2.0))
+    x = 0.5 * (math.erf(c * b * (t + 0.5)) - math.erf(c * b * (t - 0.5)))
+    return x
+
+gfsk_cache = None
+gfsk_cache_sps = None
+
+# three symbols wide.
+# most of the pulse is in the center symbol.
+def gfsk_window(samples_per_symbol):
+    global gfsk_cache_sps, gfsk_cache
+    if gfsk_cache_sps == samples_per_symbol:
+      return gfsk_cache
+
+    v = numpy.zeros(3 * samples_per_symbol)
+    for i in range(0, len(v)):
+        x = i / float(samples_per_symbol)
+        x -= 1.5
+        y = gfsk_point(1.0, x)
+        v[i] = y
+    v = v / numpy.sum(v)
+
+    gfsk_cache_sps = samples_per_symbol
+    gfsk_cache = v
+
+    return v
+
+# gaussian-smoothed fsk, for FT4.
+# the gaussian smooths the instantaneous frequencies.
+def gfsk(symbols, hza, spacing, rate, symsamples, phase0=0.0):
+    # compute frequency for each symbol, in hz[0]..hz[1].
+    symhz = numpy.zeros(len(symbols))
+    for bi in range(0, len(symbols)):
+        base_hz = hza[0] + (hza[1] - hza[0]) * (bi / float(len(symbols)))
+        fr = base_hz + (symbols[bi] * spacing)
+        symhz[bi] = fr
+
+    # frequency for each sample.
+    hzv = numpy.repeat(symhz, symsamples)
+
+    # gaussian smooth the per-sample frequency vector.
+    gwin = gfsk_window(symsamples)
+    npad = int(1.5 * symsamples)
+    pad1 = numpy.repeat(hzv[0], npad)
+    pad2 = numpy.repeat(hzv[-1], npad - 1)
+    hzv = numpy.concatenate( [ pad1, hzv, pad2 ] )
+
+    hzv = numpy.convolve(hzv, gwin, 'valid') # 315
+    # hzv = scipy.signal.convolve(hzv, gwin, 'valid') # 311
+    # hzv = scipy.signal.fftconvolve(hzv, gwin, 'valid') # 198
+
+    # advance angle for each sample
+    dtheta = (hzv * 2.0 * numpy.pi) / float(rate)
+
+    # start at pi/2 (so it's a cosine wave),
+    # and so that (for FT8 &c) FFT phases are zero for
+    # all symbols when hz is centered on a bin and
+    # the FFTs start exactly at the start of the signal.
+    dtheta = numpy.append([math.pi/2], dtheta[0:-1])
+
+    # cumulative angle.
+    angles = numpy.cumsum(dtheta)
+
+    # start at indicated phase.
+    angles = angles + phase0
+
+    a = numpy.sin(angles)
+
+    return a
+
+# weighted choice (to pick bands).
+# a[i] = [ value, weight ]
+def wchoice(a, n):
+    total = 0.0
+    for e in a:
+        total += e[1]
+
+    ret = [ ]
+    while len(ret) < n:
+        x = random.random() * total
+        for ai in range(0, len(a)):
+            e = a[ai]
+            if x <= e[1]:
+                ret.append(e[0])
+                total -= e[1]
+                a = a[0:ai] + a[ai+1:]
+                break
+            x -= e[1]
+
+    return ret
+
+def wchoice_test():
+    a = [ [ "a", .1 ], [ "b", .1 ], [ "c", .4 ], [ "d", .3 ], [ "e", .1 ] ]
+    counts = { }
+    for iter in range(0, 500):
+        x = wchoice(a, 2)
+        assert len(x) == 2
+        for e in x:
+            counts[e] = counts.get(e, 0) + 1
+    print(counts)
+
+# how long does freq_shift take?
+# 0.03 seconds
+def shift_bench():
+    rate = 12000
+    seconds = 13
+    samples = numpy.random.random(seconds * rate)
+
+    t0 = time.time()
+    iters = 100
+    for iter in range(0, iters):
+        junk = freq_shift(samples, -1190, 1.0 / rate)
+    t1 = time.time()
+    print("%f" % ((t1 - t0) / iters))
+
+# how long do filters take?
+# order 5 :  0.0014 seconds
+# order 17 : 0.003 seconds
+# cheby_lowpass: 0.005
+# cheby_highpass: 0.005
+def filter_bench():
+    rate = 12000
+    seconds = 13
+    samples = numpy.random.random(seconds * rate)
+
+    for order in [ 5, 7, 9, 13, 17]:
+        t0 = time.time()
+        iters = 100
+        for iter in range(0, iters):
+            #f = butter_lowpass(1300, rate, order=order)
+            f = cheby_highpass(1300, rate)
+            junk = scipy.signal.lfilter(f[0], f[1], samples)
+        t1 = time.time()
+        print("order %d : %f" % (order, (t1 - t0) / iters))
+
+# for testing, plot filter response.
+def plot_filter():
+    rate = 12000
+
+    import matplotlib.pyplot as plt
+    plt.figure(1)
+    plt.clf()
+
+    if False:
+        for order in [9]:
+            f = butter_lowpass(0.45 * 3000, rate, order=order)
+            w, h = scipy.signal.freqz(f[0], f[1], worN=2000)
+            plt.plot((rate * 0.5 / numpy.pi) * w, abs(h), label="order=%d"%(order))
+
+    if False:
+        f = cheby_lowpass(0.45 * 3000, rate)
+        w, h = scipy.signal.freqz(f[0], f[1], worN=2000)
+        plt.plot((rate * 0.5 / numpy.pi) * w, abs(h), label="cheby-low-1")
+
+    if False:
+        f = new_cheby_lowpass(0.48 * 3000, 0.52 * 3000, 1.0, 60, "cheby1", rate)
+        w, h = scipy.signal.freqz(f[0], f[1], worN=2000)
+        plt.plot((rate * 0.5 / numpy.pi) * w, abs(h), label="cheby-low-2")
+
+    if False:
+        f = new_cheby_lowpass(0.48 * 3000, 0.58 * 3000, 0.3, 50, "cheby1", rate)
+        w, h = scipy.signal.freqz(f[0], f[1], worN=2000)
+        plt.plot((rate * 0.5 / numpy.pi) * w, abs(h), label="cheby-low-3")
+
+    if False:
+        f = new_cheby_lowpass(0.48 * 3000, 0.58 * 3000, 0.3, 50, "cheby2", rate)
+        w, h = scipy.signal.freqz(f[0], f[1], worN=2000)
+        plt.plot((rate * 0.5 / numpy.pi) * w, abs(h), label="cheby-low-4")
+
+    highcut = 150
+
+    if True:
+        f = cheby_highpass(highcut, rate)
+        w, h = scipy.signal.freqz(f[0], f[1], worN=2000)
+        plt.plot((rate * 0.5 / numpy.pi) * w, abs(h), label="old-cheby-high")
+
+    if True:
+        f = new_cheby_highpass(highcut - 20, highcut + 20, rate)
+        w, h = scipy.signal.freqz(f[0], f[1], worN=2000)
+        plt.plot((rate * 0.5 / numpy.pi) * w, abs(h), label="new-cheby-high")
+
+    plt.xlim([0,3000])
+    plt.xlabel("Hz")
+    plt.ylabel("Gain")
+    plt.grid(True)
+    plt.legend(loc='best')
+    plt.show()

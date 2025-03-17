@@ -1,0 +1,10 @@
+{
+    "sample_rate": 44100,
+    "channels": 1,
+    "record_seconds": 13.5,
+    "advance_seconds": 0.2,
+    "temp_dir": "/tmp",
+    "output_dir": "recordings",
+    "save_recordings": true,
+    "log_level": "INFO"
+} 
