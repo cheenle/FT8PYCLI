@@ -20,10 +20,12 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
-venv/
-env/
-ENV/
+# Project specific
+logs/
+temp/
+recordings/
+*.wav
+*.log
 
 # IDE
 .idea/
@@ -31,12 +33,18 @@ ENV/
 *.swp
 *.swo
 
-# Project specific
-logs/
-recordings/
-temp/
-config/ft8pycli.json
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
 
-# OS specific
+# OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db 

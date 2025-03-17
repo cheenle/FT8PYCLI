@@ -1,0 +1,13 @@
+{
+  "decoder_path": null,
+  "target_sample_rate": 12000,
+  "record_seconds": 13.5,
+  "advance_seconds": 0.2,
+  "output_dir": "/opt/metagpt/workspace/wsjt/wsjtx-2.7.0/FT8PYCLI/recordings",
+  "temp_dir": "/opt/metagpt/workspace/wsjt/wsjtx-2.7.0/FT8PYCLI/temp",
+  "log_level": "DEBUG",
+  "parallel_decoding": true,
+  "max_workers": 3,
+  "save_recordings": false,
+  "save_decoded": true
+}

@@ -1,21 +1,20 @@
 # FT8PYCLI
 
-FT8PYCLI 是一个基于 Python 的 FT8 信号解码命令行工具，支持实时录音和解码 FT8 信号。
+FT8PYCLI 是一个命令行工具，用于实时解码 FT8 数字模式信号。它支持从声卡或音频文件中读取信号并进行解码。
 
 ## 功能特点
 
-- 支持实时录音和解码 FT8 信号
-- 支持多种音频输入设备（包括 USB 设备）
-- 自动检测和配置音频设备
-- 支持保存录音文件
-- 详细的日志记录
-- 配置文件支持
+- 实时从声卡录制音频并解码 FT8 信号
+- 支持从 WAV 文件读取并解码
+- 自动同步 FT8 时间周期
+- 支持多种采样率和音频设备
+- 解码结果实时显示
 
 ## 系统要求
 
-- Python 3.6 或更高版本
-- ALSA 音频系统（Linux）
-- 支持音频输入的 USB 设备（可选）
+- Python 3.7+
+- Linux/macOS/Windows
+- 支持的声卡设备
 
 ## 安装
 
@@ -30,67 +29,56 @@ cd FT8PYCLI
 pip install -r requirements.txt
 ```
 
+## 使用方法
+
+1. 从声卡实时解码：
+```bash
+python src/ft8pycli.py --device "0,0"  # 使用第一个声卡的左声道
+```
+
+2. 从WAV文件解码：
+```bash
+python src/ft8pycli.py --file input.wav
+```
+
+3. 查看帮助：
+```bash
+python src/ft8pycli.py --help
+```
+
 ## 配置
 
-1. 复制配置文件模板：
+1. 创建配置文件：
 ```bash
 cp config/ft8pycli.json.example config/ft8pycli.json
 ```
 
-2. 编辑配置文件 `config/ft8pycli.json`，根据需要修改以下参数：
-- `sample_rate`: 采样率（默认：44100）
-- `channels`: 声道数（默认：1）
-- `record_seconds`: 录音时长（默认：13.5秒）
-- `advance_seconds`: 提前开始录音的时间（默认：0.2秒）
-- `temp_dir`: 临时文件目录
-- `output_dir`: 录音输出目录
-
-## 使用方法
-
-1. 列出可用设备：
-```bash
-python src/ft8pycli.py
-```
-
-2. 开始实时录音和解码：
-```bash
-python src/ft8pycli.py live <设备索引>
-```
-
-3. 解码音频文件：
-```bash
-python src/ft8pycli.py decode <音频文件路径>
+2. 编辑配置文件，设置采样率、设备等参数：
+```json
+{
+    "target_sample_rate": 12000,
+    "record_seconds": 13.5,
+    "advance_seconds": 0.2
+}
 ```
 
 ## 目录结构
 
 ```
 FT8PYCLI/
-├── config/             # 配置文件目录
-├── docs/              # 文档
-├── ft8decoder/        # FT8解码器
+├── config/             # 配置文件
+├── src/               # 源代码
+│   ├── ft8pycli.py    # 主程序
+│   ├── ft8_decoder.py # 解码器
+│   └── ...
 ├── logs/              # 日志文件
 ├── recordings/        # 录音文件
-├── src/               # 源代码
-├── tests/             # 测试文件
 └── temp/              # 临时文件
-```
-
-## 开发
-
-1. 运行测试：
-```bash
-python -m pytest tests/
-```
-
-2. 代码风格检查：
-```bash
-flake8 src/
 ```
 
 ## 许可证
 
-MIT License
+本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
 
 ## 贡献
 
@@ -98,5 +86,5 @@ MIT License
 
 ## 致谢
 
-- [WSJT-X](https://physics.princeton.edu/pulsar/k1jt/wsjtx.html) - FT8 协议和参考实现
-- [PyAudio](https://people.csail.mit.edu/hubert/pyaudio/) - 音频处理库 
+- 感谢 WSJT-X 项目提供的 FT8 协议规范
+- 感谢所有贡献者的支持 

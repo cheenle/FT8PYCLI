@@ -1,17 +1,7 @@
 #
-# shared support routines for weak*.py
+# shared support routines for signal processing
 #
 
-#
-# read weak.ini
-# e.g. weakcfg.get("wsprmon", "mycall") -> None or "W1XXX"
-#
-
-try:
-  import configparser
-except:
-  from six.moves import configparser
-import threading
 import numpy
 import scipy
 import scipy.signal
@@ -22,8 +12,6 @@ import sys
 import os
 import math
 import random
-import types
-#import scikits.samplerate
 from scipy.signal import windows
 try:
     # 尝试从windows子模块导入
@@ -38,19 +26,10 @@ except ImportError:
 
 have_fftw = False
 try:
-  import pyfftw.interfaces.numpy_fft
-  have_fftw = True
+    import pyfftw.interfaces.numpy_fft
+    have_fftw = True
 except:
-  pass
-
-def cfg(program, key):
-    cfg = configparser.SafeConfigParser()
-    cfg.read(['weak-local.cfg', 'weak.cfg'])
-
-    if cfg.has_option(program, key):
-        return cfg.get(program, key)
-
-    return None
+    pass
 
 # make a butterworth IIR bandpass filter
 def butter_bandpass(lowcut, highcut, samplerate, order=5):
